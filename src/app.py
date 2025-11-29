@@ -5,6 +5,7 @@ import mercantile
 import numpy as np
 import pandas as pd
 import streamlit as st
+from scipy.spatial.distance import pdist
 from streamlit_folium import st_folium
 
 st.set_page_config(layout="wide", page_title="Map Re-ranking Demo")
@@ -35,10 +36,42 @@ def generate_dummy_data(n: int = 1000):
     return data
 
 
-def select_points_by_score_dist(
+def calc_collision_count(df: pd.DataFrame, zoom: int, min_overlap_px: int) -> dict:
+    """評価指標の計算"""
+    if len(df) < 2:
+        return 0
+
+    earth_circumference = 2 * math.pi * 6378137
+    meters_per_pixel = earth_circumference / (256 * 2**zoom)
+
+    coords_px = []
+    for _, row in df.iterrows():
+        mx, my = mercantile.xy(row["lon"], row["lat"])
+        px = mx / meters_per_pixel
+        py = my / meters_per_pixel
+        coords_px.append([px, py])
+
+    collision_count = np.sum(pdist(coords_px) < min_overlap_px)
+    return collision_count
+
+
+def select_points_by_score(df_in_view: pd.DataFrame, limit: int):
+    """ピンを立てる地点をスコアから決定する
+
+    Args:
+        df_in_view (pd.DataFrame): ビューポート内にある地点のデータ
+        limit (int): 表示するピンの上限数
+
+    Returns:
+        pd.DataFrame: 選択された地点のデータ
+    """
+    return df_in_view.sort_values("score", ascending=False).head(limit)
+
+
+def select_points_score_dist_hard(
     df_in_view: pd.DataFrame, limit: int, zoom: int, min_pixel_dist: int = 50
 ):
-    """ピンを立てる地点をスコアと距離から決定する
+    """ピンを立てる地点をスコアと距離から決定する。ピン同士の最小距離が`min_pixel_dist`より大きくなるよう選択する。
 
     Args:
         df_in_view (pd.DataFrame): ビューポート内にある地点のデータ
@@ -81,7 +114,7 @@ def select_points_by_score_dist(
         is_far_enough = True
         for smx, smy in selected_meters:
             dist_m = math.sqrt((mx - smx) ** 2 + (my - smy) ** 2)
-            if dist_m < min_dist_meters:
+            if dist_m <= min_dist_meters:
                 is_far_enough = False
                 break
 
@@ -93,26 +126,82 @@ def select_points_by_score_dist(
     return pd.DataFrame(selected)
 
 
-def select_points_by_score(df_in_view: pd.DataFrame, limit: int):
-    """ピンを立てる地点をスコアから決定する
+def select_points_score_dist_soft(
+    df_in_view: pd.DataFrame,
+    limit: int,
+    zoom: int,
+    min_pixel_dist: int,
+    penalty_weight: float,
+):
+    """ピンを立てる地点をスコアと距離から決定する。スコアが高ければ距離が`min_pixel_dist`以下でも採用する。
 
     Args:
         df_in_view (pd.DataFrame): ビューポート内にある地点のデータ
         limit (int): 表示するピンの上限数
+        zoom (int): ズームレベル
+        min_pixel_dist (int): 表示されるピンとピンの最小距離
+        penalty_weight (float): 距離制約の重み係数
 
     Returns:
         pd.DataFrame: 選択された地点のデータ
     """
-    return df_in_view.sort_values("score", ascending=False).head(limit)
+    if df_in_view.empty:
+        return df_in_view
+
+    earth_circumference = 2 * math.pi * 6378137
+    meters_per_pixel = earth_circumference / (256 * 2**zoom)
+    limit_dist_meters = min_pixel_dist * meters_per_pixel
+
+    candidates = df_in_view.copy()
+    coords = candidates.apply(lambda x: mercantile.xy(x["lon"], x["lat"]), axis=1)
+    candidates["mx"] = [c[0] for c in coords]
+    candidates["my"] = [c[1] for c in coords]
+
+    selected_indices = []
+    selected_coords = []
+
+    for _ in range(limit):
+        if len(candidates) == 0:
+            break
+
+        remaining = candidates.drop(selected_indices)
+        if remaining.empty:
+            break
+
+        if not selected_indices:
+            best_idx = remaining["score"].idxmax()
+            selected_indices.append(best_idx)
+            selected_coords.append(
+                (remaining.loc[best_idx, "mx"], remaining.loc[best_idx, "my"])
+            )
+            continue
+
+        rem_coords = remaining[["mx", "my"]].values
+        rem_scores = remaining["score"].values
+        sel_coords_arr = np.array(selected_coords)
+
+        diff = rem_coords[:, np.newaxis, :] - sel_coords_arr[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2))
+        normalized_dists = dists / limit_dist_meters
+        penalties = np.maximum(0, 1.0 - normalized_dists)
+        total_penalties = np.sum(penalties, axis=1)
+        gains = rem_scores - (penalty_weight * total_penalties)
+        best_local_idx = np.argmax(gains)
+        best_global_idx = remaining.index[best_local_idx]
+
+        selected_indices.append(best_global_idx)
+        selected_coords.append(
+            (remaining.loc[best_global_idx, "mx"], remaining.loc[best_global_idx, "my"])
+        )
+
+    return df_in_view.loc[selected_indices]
 
 
-def create_map(
-    center: list[float, float], zoom: int, df_pins: pd.DataFrame, color: str
-):
+def create_map(center: list[float], zoom: int, df_pins: pd.DataFrame, color: str):
     """地図インスタンスを作成してピンを配置する
 
     Args:
-        center (list[float, float]): 中心座標
+        center (list[float]): 中心座標
         zoom (int): ズームレベル
         df_pins (pd.DataFrame): 表示するピンのデータ
         color (str): ピンの色
@@ -149,8 +238,9 @@ if "map_state" not in st.session_state:
 with st.sidebar:
     st.header("Global Settings")
     limit_pins = st.slider("表示上限数 (Top N)", 5, 100, 30)
-    min_pixels = st.slider("最小間隔 (px)", 10, 150, 50, help="Smartロジックのみ適用")
-    st.info("👈 左側の地図（Baseline）を動かすと、右側も追従します。")
+    min_pixels = st.slider("最小間隔 (px)", 10, 150, 50)
+    lambda_val = st.slider("距離ソフト制約の重み係数", 0.0, 10.0, 2.0, 0.1)
+    st.info("ベースラインの地図を動かすと、その他の地図も追従します。")
 
 last_interaction = st.session_state.get("map_baseline_widget", None)
 
@@ -181,35 +271,70 @@ if bounds:
 else:
     df_view = df_all.copy()
 
-df_score_only = select_points_by_score(df_view, limit_pins)
-df_score_dist = select_points_by_score_dist(
-    df_view, limit_pins, current_zoom, min_pixel_dist=min_pixels
+
+df_points_score_only = select_points_by_score(df_view, limit_pins)
+df_points_score_dist_hard = select_points_score_dist_hard(
+    df_view, limit_pins, current_zoom, min_pixels
+)
+df_points_score_dist_soft = select_points_score_dist_soft(
+    df_view, limit_pins, current_zoom, min_pixels, lambda_val
 )
 
-col1, col2 = st.columns(2)
+collision_count_score_only = calc_collision_count(
+    df_points_score_only, current_zoom, min_pixels
+)
+collision_count_score_dist_hard = calc_collision_count(
+    df_points_score_dist_hard, current_zoom, min_pixels
+)
+collision_count_score_dist_soft = calc_collision_count(
+    df_points_score_dist_soft, current_zoom, min_pixels
+)
 
-with col1:
-    st.subheader("Score Only")
-    if not df_score_only.empty:
-        score_1 = df_score_only["score"].mean()
-        st.metric("Avg Score", f"{score_1:.2f}")
-    else:
-        st.metric("Avg Score", "0.00")
+st.subheader("Metrics Summary")
+summary_data = {
+    "Logic": [
+        "Score Only",
+        "Score and Distance (Hard Constraint)",
+        "Score and Distance (Soft Constraint)",
+    ],
+    "Displayed Pins": [
+        len(df_points_score_only),
+        len(df_points_score_dist_soft),
+        len(df_points_score_dist_hard),
+    ],
+    "Avg Score": [
+        f"{df_points_score_only['score'].mean():.2f}"
+        if not df_points_score_only.empty
+        else "0.00",
+        f"{df_points_score_dist_hard['score'].mean():.2f}"
+        if not df_points_score_dist_hard.empty
+        else "0.00",
+        f"{df_points_score_dist_hard['score'].mean():.2f}"
+        if not df_points_score_dist_hard.empty
+        else "0.00",
+    ],
+    "Collision Count": [
+        collision_count_score_only,
+        collision_count_score_dist_hard,
+        collision_count_score_dist_soft,
+    ],
+}
+st.dataframe(pd.DataFrame(summary_data), hide_index=True, use_container_width=True)
 
-    m1 = create_map(current_center, current_zoom, df_score_only, "red")
-    st_folium(m1, width="100%", height=500, key="map_baseline_widget")
-    with st.expander("Show List (Baseline)"):
-        st.dataframe(df_score_only[["name", "score"]], hide_index=True)
+st.divider()
 
-with col2:
-    st.subheader("Score + Distance")
-    if not df_score_dist.empty:
-        score_2 = df_score_dist["score"].mean()
-        st.metric("Avg Score", f"{score_2:.2f}")
-    else:
-        st.metric("Avg Score", "0.00")
+st.markdown("### Score Only")
+map_score_only = create_map(current_center, current_zoom, df_points_score_only, "red")
+st_folium(map_score_only, width="100%", height=400)
 
-    m2 = create_map(current_center, current_zoom, df_score_dist, "blue")
-    st_folium(m2, width="100%", height=500, key="map_smart_widget")
-    with st.expander("Show List (Smart)"):
-        st.dataframe(df_score_dist[["name", "score"]], hide_index=True)
+st.markdown("### Score and Distance (Hard Constraint)")
+map_score_dist_hard = create_map(
+    current_center, current_zoom, df_points_score_dist_hard, "blue"
+)
+st_folium(map_score_dist_hard, width="100%", height=400)
+
+st.markdown("### Score and Distance (Soft Constraint)")
+map_score_disst_soft = create_map(
+    current_center, current_zoom, df_points_score_dist_soft, "green"
+)
+st_folium(map_score_disst_soft, width="100%", height=400)
